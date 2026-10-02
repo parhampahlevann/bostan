@@ -7,11 +7,19 @@
 #  Iran server    : runs "hysteria client"  (tcpForwarding / udpForwarding)
 #  Foreign server : runs "hysteria server"
 #
+#  v2.1 changes
+#   - obfuscation (salamander) is now ON by default (plain QUIC is the easiest
+#     thing for Iranian DPI to drop)
+#   - per-tunnel switch for the Chrome QUIC fingerprint (Hysteria >= 2.11)
+#   - the connect check waits long enough (the client needs ~31 s to give up),
+#     shows the real error and prints hints matching that error
+#   - new menu 9: diagnose connection (MTU probe on Iran, packet capture on foreign)
+#
 #  Optional environment variable:
 #    HYSTERIA_MIRROR=https://your-mirror/   (prefix used for GitHub downloads)
 # =============================================================================
 
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.1"
 FALLBACK_VERSION="v2.12.3"          # used only if the latest version cannot be looked up
 CONF_DIR="${HY_CONF_DIR:-/etc/hysteria}"
 BIN="${HY_BIN:-/usr/local/bin/hysteria}"
@@ -168,6 +176,15 @@ ensure_deps() {
   return 1
 }
 
+ensure_pkg() {   # command [package]   (best effort, used by the diagnose menu)
+  command -v "$1" >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${2:-$1}" >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y -q "${2:-$1}" >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then yum install -y -q "${2:-$1}" >/dev/null 2>&1; fi
+  command -v "$1" >/dev/null 2>&1
+}
+
 tune_sysctl() {   # QUIC needs large UDP socket buffers
   cat > "$SYSCTL_FILE" <<'EOF'
 net.core.rmem_max=16777216
@@ -314,7 +331,7 @@ obfs_block() {   # y|n password
   printf 'obfs:\n  type: salamander\n  salamander:\n    password: "%s"\n' "$2"
 }
 
-quic_block() {   # server|client  profile(1|2|3)
+quic_block() {   # server|client  profile(1|2|3)  [chrome-parrot y|n  (client only)]
   local a b c d s
   case "$2" in
     2) a=50331648;  b=100663296; c=100663296; d=201326592; s=8192  ;;
@@ -329,6 +346,8 @@ quic_block() {   # server|client  profile(1|2|3)
   echo "  maxIdleTimeout: 30s"
   if [[ $1 == server ]]; then echo "  maxIncomingStreams: $s"; else echo "  keepAlivePeriod: 10s"; fi
   echo "  disablePathMTUDiscovery: false"
+  # Hysteria >= 2.11 makes the client QUIC handshake look like Chrome; older versions ignore this key
+  if [[ $1 == client && ${3:-y} == n ]]; then echo "  disableChromeParrot: true"; fi
 }
 
 choose_profile() {   # VAR default
@@ -401,7 +420,7 @@ setup_foreign() {
     err "Invalid password."; def_pass="$(rand_pass)"
   done
   S_PASS="$pass_in"
-  if yesno "Enable Salamander obfuscation? (Iran side must use the same setting)" "${S_OBFS:-n}"; then S_OBFS=y; else S_OBFS=n; fi
+  if yesno "Enable Salamander obfuscation? (recommended for Iran; the Iran side must use the same setting)" "${S_OBFS:-y}"; then S_OBFS=y; else S_OBFS=n; fi
   choose_profile S_PROFILE "${S_PROFILE:-1}"
 
   {
@@ -445,6 +464,7 @@ EOF
   echo "  Obfuscation : $([[ $S_OBFS == y ]] && echo "enabled (key = password)" || echo disabled)"
   echo "  Cert pin    : $(cert_pin)   (optional - pins the certificate)"
   warn "If you use a cloud firewall / security group, allow UDP $S_PORT there as well."
+  warn "After the Iran tunnel is created and does not connect, run menu 9 here while restarting it."
 }
 
 # ------------------------------- Iran tunnels --------------------------------
@@ -520,7 +540,7 @@ write_client_config() {   # n   (reads the T_* variables of create_tunnel)
     echo "  insecure: true"
     [[ -n $T_PIN ]] && echo "  pinSHA256: \"${T_PIN}\""
     obfs_block "$T_OBFS" "$T_PASS"
-    quic_block client "$T_PROFILE"
+    quic_block client "$T_PROFILE" "$T_PARROT"
     if [[ $T_MODE != udp ]]; then
       echo "tcpForwarding:"
       for p in ${T_PORTS//,/ }; do
@@ -537,32 +557,58 @@ write_client_config() {   # n   (reads the T_* variables of create_tunnel)
   chmod 600 "$(tunnel_cfg "$n")"
 }
 
+connect_hints() {   # error-line
+  local e="$1"
+  echo
+  if grep -qiE 'no recent network activity|timeout|deadline' <<<"$e"; then
+    cat <<EOF
+${YELLOW}The QUIC handshake got no answer, so the foreign server never saw an authenticated client.
+Check in this order:
+  1) Obfuscation must be IDENTICAL on both servers (same on/off, key = password).
+     Easiest: run "Setup FOREIGN server" again, answer Y to obfuscation, then Edit this tunnel and answer Y too.
+  2) Do the packets reach the foreign server?  Run menu 9 on the FOREIGN server, and restart this tunnel while it captures.
+  3) Edit this tunnel (menu 3) and answer n to "Chrome QUIC fingerprint" - helps on paths with a small MTU or picky DPI.
+  4) Try another UDP port on the foreign server (for example 8443, 2096 or 4443).
+  5) Cloud firewall / security group of the foreign server must allow that UDP port.
+  6) Run "Setup FOREIGN server" again so the foreign server uses the latest binary and an ECDSA certificate.${RESET}
+EOF
+  elif grep -qiE 'auth|status code|40[0-9]' <<<"$e"; then
+    echo "${YELLOW}The server answered but rejected the login: the password is different on the two servers.${RESET}"
+  elif grep -qiE 'pin|certificate|x509|tls' <<<"$e"; then
+    echo "${YELLOW}TLS problem: the certificate pin does not match. Re-enter the pin shown by the foreign server, or clear it with '-'.${RESET}"
+  elif grep -qiE 'no such host|lookup|resolve' <<<"$e"; then
+    echo "${YELLOW}The foreign server address cannot be resolved. Use the IP address instead of a domain name.${RESET}"
+  else
+    echo "${YELLOW}Unknown error. Run menu 9 on both servers and check menu 7 (logs).${RESET}"
+  fi
+}
+
 verify_tunnel() {   # n since-timestamp
-  local svc="hysteria$1" i
-  info "Waiting for the tunnel to connect ..."
-  for i in 1 2 3 4 5 6 7 8; do
+  local svc="hysteria$1" i j fail=""
+  info "Waiting for the tunnel to connect (the client needs up to ~35 s to give up) ..."
+  for i in $(seq 1 24); do
     sleep 2
-    systemctl is-active --quiet "$svc" || continue
-    if journalctl -u "$svc" --since "$2" --no-pager 2>/dev/null | grep -q 'connected to server'; then
+    j=$(journalctl -u "$svc" --since "$2" --no-pager -o cat 2>/dev/null)
+    if grep -q 'connected to server' <<<"$j"; then
       ok "Tunnel #$1 is CONNECTED to the foreign server."
       return 0
     fi
+    fail=$(grep -m1 'failed to initialize client' <<<"$j")
+    [[ -n $fail ]] && break
   done
-  err "Tunnel #$1 did not connect. Last log lines:"
-  journalctl -u "$svc" -n 8 --no-pager 2>/dev/null | cut -c1-200 | sed 's/^/   /'
-  cat <<EOF
-${YELLOW}Common causes:
-  1) The UDP port of the foreign server is blocked (cloud firewall / security group / ufw / iptables).
-  2) Password or obfuscation setting is different on the two servers.
-  3) The foreign server still uses an old setup (Ed25519 certificate) - run "Setup FOREIGN server" again there.
-  4) The ISP drops QUIC/UDP to this IP - try another port, or enable obfuscation on both sides.${RESET}
-EOF
+  err "Tunnel #$1 did not connect."
+  if [[ -n $fail ]]; then
+    echo "   ${fail:0:230}"
+  else
+    journalctl -u "$svc" -n 6 --no-pager -o cat 2>/dev/null | cut -c1-200 | sed 's/^/   /'
+  fi
+  connect_hints "$fail"
   return 1
 }
 
 create_tunnel() {   # n  (also used to edit an existing tunnel)
   local n="$1" f_env; f_env=$(tunnel_env "$n")
-  local T_SERVER="" T_PORT="" T_PASS="" T_OBFS="" T_SNI="" T_PIN="" T_IPV="" T_PORTS="" T_MODE="" T_PROFILE=""
+  local T_SERVER="" T_PORT="" T_PASS="" T_OBFS="" T_SNI="" T_PIN="" T_IPV="" T_PORTS="" T_MODE="" T_PROFILE="" T_PARROT=""
   [[ -f $f_env ]] && . "$f_env"
   local host portin pass sni pin ports old_ports="" ts p
 
@@ -580,7 +626,8 @@ create_tunnel() {   # n  (also used to edit an existing tunnel)
     ask pass "Password (same as on the foreign server)" "$T_PASS"
     valid_pass "$pass" && break; err "Invalid password (allowed: A-Z a-z 0-9 . _ ~ @ % + = -)."
   done
-  if yesno "Is obfuscation enabled on the foreign server?" "${T_OBFS:-n}"; then T_OBFS=y; else T_OBFS=n; fi
+  if yesno "Is obfuscation enabled on the foreign server? (must match exactly)" "${T_OBFS:-y}"; then T_OBFS=y; else T_OBFS=n; fi
+  if yesno "Chrome QUIC fingerprint (default of Hysteria >= 2.11)? Answer n if the tunnel cannot connect" "${T_PARROT:-y}"; then T_PARROT=y; else T_PARROT=n; fi
   while :; do
     ask sni "SNI" "${T_SNI:-google.com}"
     valid_sni "$sni" && break; err "Invalid SNI."
@@ -608,8 +655,8 @@ create_tunnel() {   # n  (also used to edit an existing tunnel)
 
   mkdir -p "$CONF_DIR"
   write_client_config "$n"
-  printf 'T_SERVER=%q\nT_PORT=%q\nT_PASS=%q\nT_OBFS=%q\nT_SNI=%q\nT_PIN=%q\nT_IPV=%q\nT_PORTS=%q\nT_MODE=%q\nT_PROFILE=%q\n' \
-    "$T_SERVER" "$T_PORT" "$T_PASS" "$T_OBFS" "$T_SNI" "$T_PIN" "$T_IPV" "$T_PORTS" "$T_MODE" "$T_PROFILE" > "$f_env"
+  printf 'T_SERVER=%q\nT_PORT=%q\nT_PASS=%q\nT_OBFS=%q\nT_SNI=%q\nT_PIN=%q\nT_IPV=%q\nT_PORTS=%q\nT_MODE=%q\nT_PROFILE=%q\nT_PARROT=%q\n' \
+    "$T_SERVER" "$T_PORT" "$T_PASS" "$T_OBFS" "$T_SNI" "$T_PIN" "$T_IPV" "$T_PORTS" "$T_MODE" "$T_PROFILE" "$T_PARROT" > "$f_env"
   chmod 600 "$f_env"
 
   write_unit "hysteria$n" "Hysteria2 Client $n" "client -c $(tunnel_cfg "$n")"
@@ -741,6 +788,99 @@ update_binary() {
   fi
 }
 
+# ------------------------------- diagnose ------------------------------------
+mtu_probe() {   # ipv4 payload-size -> ok | toolong | noreply   (ping with Don't-Fragment)
+  local out
+  command -v ping >/dev/null 2>&1 || { echo noreply; return; }
+  out=$(ping -c 2 -W 2 -M do -s "$2" "$1" 2>&1)
+  if grep -qiE 'message too long|frag needed' <<<"$out"; then echo toolong
+  elif grep -qE ' 0% packet loss' <<<"$out"; then echo ok
+  else echo noreply; fi
+}
+
+diag_foreign() {
+  local p="" cap in out
+  [[ -f $SERVER_ENV ]] && p=$( . "$SERVER_ENV" 2>/dev/null; echo "${S_PORT:-}" )
+  [[ -n $p ]] || p=$(grep -m1 '^listen:' "$SERVER_CFG" 2>/dev/null | grep -oE '[0-9]+' | head -n1)
+  echo; info "=== Foreign server diagnosis ==="
+  echo "  service       : $(systemctl is-active "$SERVER_UNIT" 2>/dev/null)"
+  echo "  UDP port      : ${p:-?}  listening: $(port_in_use "${p:-0}" udp && echo yes || echo NO)"
+  echo "  obfuscation   : $(grep -q '^obfs:' "$SERVER_CFG" 2>/dev/null && echo ON || echo off)"
+  command -v ufw >/dev/null 2>&1 && echo "  ufw           : $(ufw status 2>/dev/null | head -n1)"
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    echo "  firewalld     : ports $(firewall-cmd --list-ports 2>/dev/null)"
+  fi
+  command -v iptables >/dev/null 2>&1 && echo "  iptables INPUT: $(iptables -S INPUT 2>/dev/null | head -n1)"
+  warn "  (a cloud firewall / security group at your provider is NOT visible from here)"
+  [[ -n $p ]] || { err "Cannot find the server port."; return 1; }
+  if ! ensure_pkg tcpdump; then
+    warn "tcpdump is not available. Run manually:  tcpdump -ni any udp port $p"
+    return 0
+  fi
+  echo
+  info "Capturing UDP port $p for up to 40 s ..."
+  echo "${WHITE}>>> NOW restart the tunnel on the Iran server (menu 3 -> Restart) <<<${RESET}"
+  trap ':' INT
+  cap=$(timeout 40 tcpdump -nn -l -i any -c 40 "udp port $p" 2>/dev/null)
+  trap 'echo; exit 130' INT
+  in=$(grep -c ' In ' <<<"$cap"); out=$(grep -c ' Out ' <<<"$cap")
+  echo "  packets received from outside : $in"
+  echo "  packets sent back             : $out"
+  if (( in == 0 )); then
+    cat <<EOF
+${YELLOW}  -> Nothing from the Iran server reaches this machine on UDP $p.
+     Causes: cloud firewall / security group, provider filtering, or the Iran ISP dropping QUIC.
+     Open UDP $p in the provider panel, then try obfuscation ON at both ends and/or a different port.${RESET}
+EOF
+  elif (( out == 0 )); then
+    cat <<EOF
+${YELLOW}  -> Packets arrive but this server never answers.
+     Most likely the obfuscation setting/password differs from the Iran side (the server silently drops what it cannot decode),
+     or a local firewall rule drops the packets after capture.${RESET}
+EOF
+  else
+    cat <<EOF
+${GREEN}  -> Packets arrive and this server answers.${YELLOW} If the Iran client still times out, the replies are being lost on the way back
+     (ISP/DPI or MTU). Try Chrome QUIC fingerprint = n on the Iran tunnel, another UDP port, and obfuscation ON.${RESET}
+EOF
+  fi
+}
+
+diag_iran() {   # n
+  local n="$1" srv host addr iface mtu r1 r2 last
+  srv=$(tunnel_server "$n"); host="${srv%:*}"; host="${host#\[}"; host="${host%\]}"
+  echo; info "=== Iran tunnel #$n -> $srv ==="
+  echo "  service       : $(systemctl is-active "hysteria$n" 2>/dev/null)"
+  echo "  obfuscation   : $(grep -q '^obfs:' "$(tunnel_cfg "$n")" 2>/dev/null && echo ON || echo off)"
+  echo "  chrome QUIC   : $(grep -q 'disableChromeParrot: true' "$(tunnel_cfg "$n")" 2>/dev/null && echo "off (compatibility mode)" || echo "on (default)")"
+  last=$(journalctl -u "hysteria$n" -n 60 --no-pager -o cat 2>/dev/null | grep -E 'connected to server|failed to initialize client' | tail -n1)
+  echo "  last result   : ${last:0:200}"
+  if is_ipv4 "$host"; then addr="$host"; else addr=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}'); fi
+  [[ -n $addr ]] || { warn "  cannot resolve $host to an IPv4 address - MTU probe skipped"; return 0; }
+  iface=$(ip -o route get "$addr" 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -n1)
+  mtu=$(cat "/sys/class/net/${iface:-none}/mtu" 2>/dev/null)
+  echo "  interface     : ${iface:-?}   MTU ${mtu:-?}"
+  r1=$(mtu_probe "$addr" 1250); r2=$(mtu_probe "$addr" 1280)
+  echo "  DF ping 1278-byte packet (Chrome-style QUIC Initial)  : $r1"
+  echo "  DF ping 1308-byte packet (standard QUIC Initial)      : $r2"
+  if [[ $r1 == toolong ]]; then
+    warn "  -> This server's link MTU is too small for QUIC. Hysteria cannot connect from here until the MTU is raised (ask the provider)."
+  elif [[ $r2 == toolong ]]; then
+    warn "  -> Only the Chrome-style Initial fits this link: keep 'Chrome QUIC fingerprint' = y."
+  elif [[ $r1 == noreply || $r2 == noreply ]]; then
+    warn "  -> No ICMP answer: inconclusive (many hosts drop ping). It does not prove a problem."
+  else
+    ok "  -> MTU looks fine."
+  fi
+}
+
+run_diag() {
+  local n found=0
+  if [[ -f $UNIT_DIR/$SERVER_UNIT.service ]]; then found=1; diag_foreign; fi
+  for n in $(list_tunnel_numbers); do found=1; diag_iran "$n"; done
+  (( found )) || warn "Nothing is installed yet."
+}
+
 cleanup_legacy_iptables() {   # counters created by older versions of this script
   command -v iptables >/dev/null 2>&1 || return 0
   local rule chain
@@ -791,8 +931,9 @@ main() {
       "6 | Update Hysteria binary" \
       "7 | View logs" \
       "8 | Uninstall everything" \
+      "9 | Diagnose connection   (run on BOTH servers)" \
       "0 | Exit"
-    read -rp "Select an option [0-8]: " c
+    read -rp "Select an option [0-9]: " c
     case "$c" in
       1) setup_foreign; pause ;;
       2) setup_iran; pause ;;
@@ -802,6 +943,7 @@ main() {
       6) update_binary; pause ;;
       7) show_logs; pause ;;
       8) uninstall_all; pause ;;
+      9) run_diag; pause ;;
       0) exit 0 ;;
       *) err "Invalid option." ;;
     esac
